@@ -1,0 +1,144 @@
+#!/bin/bash
+
+# Exit on any error
+set -e
+
+# Check for root privileges
+if [ "$EUID" -ne 0 ]; then 
+    echo "Please run as root"
+    exit 1
+fi
+
+# Backup SELinux config
+cp /etc/selinux/config /etc/selinux/config.backup
+
+# Disable SELinux
+sed -i 's/SELINUX=enforcing/SELINUX=disabled/g' /etc/selinux/config
+cat /etc/selinux/config
+setenforce 0 || echo "SELinux already disabled or in permissive mode"
+
+# Add Firewall rules for HTTP and HTTPS
+firewall-cmd --permanent --add-service=http || echo "HTTP rule already exists"
+firewall-cmd --permanent --add-service=https || echo "HTTPS rule already exists"
+firewall-cmd --reload
+
+# Install EPEL repository
+yum install -y epel-release || {
+    echo "Failed to install EPEL repository"
+    exit 1
+}
+
+# Install required dependencies
+yum install -y wget php php-gd httpd gcc glibc-common gd gd-devel make net-snmp perl perl-devel openssl unzip || {
+    echo "Failed to install dependencies"
+    exit 1
+}
+
+# Create working directory
+WORK_DIR="/tmp/nagios_install"
+mkdir -p "$WORK_DIR"
+cd "$WORK_DIR" || exit 1
+
+# Download Nagios Core
+wget https://assets.nagios.com/downloads/nagioscore/releases/nagios-4.5.9.tar.gz || {
+    echo "Failed to download Nagios Core"
+    exit 1
+}
+
+# Extract Nagios Core package
+tar -xvf nagios-4.5.9.tar.gz || {
+    echo "Failed to extract Nagios Core"
+    exit 1
+}
+cd nagios-4.5.9 || exit 1
+
+# Create Nagios user and group
+groupadd nagcmd || echo "Group nagcmd already exists"
+groupadd nagios || echo "Group nagios already exists"
+useradd -g nagios -G nagcmd nagios || echo "User nagios already exists"
+usermod -aG nagcmd apache || echo "Apache user already in nagcmd group"
+
+# Configure and compile Nagios Core
+./configure --with-command-group=nagcmd || {
+    echo "Configure failed"
+    exit 1
+}
+
+make all || {
+    echo "Make all failed"
+    exit 1
+}
+
+# Installation steps with error checking
+for cmd in "make install" "make install-init" "make install-commandmode" "make install-config" "make install-exfoliation" "make install-webconf"; do
+    $cmd || {
+        echo "$cmd failed"
+        exit 1
+    }
+done
+
+# Create Nagios admin user for web access
+echo -e "nagiosadmin\nnagiosadmin" | htpasswd -c /usr/local/nagios/etc/htpasswd.users nagiosadmin || {
+    echo "Failed to create nagiosadmin user"
+    exit 1
+}
+
+# Enable and start services
+systemctl enable httpd
+systemctl start httpd
+systemctl enable nagios
+systemctl start nagios
+
+# Verify Nagios configuration
+/usr/local/nagios/bin/nagios -v /usr/local/nagios/etc/nagios.cfg || {
+    echo "Nagios configuration verification failed"
+    exit 1
+}
+
+# Download and install Nagios plugins
+cd "$WORK_DIR" || exit 1
+wget https://nagios-plugins.org/download/nagios-plugins-2.4.11.tar.gz || {
+    echo "Failed to download Nagios plugins"
+    exit 1
+}
+
+tar -xvf nagios-plugins-2.4.11.tar.gz || {
+    echo "Failed to extract Nagios plugins"
+    exit 1
+}
+
+cd nagios-plugins-2.4.11 || exit 1
+./configure --with-nagios-user=nagios --with-nagios-group=nagcmd || {
+    echo "Plugin configure failed"
+    exit 1
+}
+
+make || {
+    echo "Plugin make failed"
+    exit 1
+}
+
+make install || {
+    echo "Plugin installation failed"
+    exit 1
+}
+
+# Clean up
+cd /
+rm -rf "$WORK_DIR"
+
+# Verify plugins installation
+if [ ! -d "/usr/local/nagios/libexec" ]; then
+    echo "Plugins directory not found!"
+    exit 1
+fi
+
+# Get server IP
+SERVER_IP=$(ip -4 addr show | grep -oP '(?<=inet\s)\d+(\.\d+){3}' | grep -v "127.0.0.1" | head -n 1)
+
+echo "Nagios installation completed successfully!"
+echo "Access it via http://${SERVER_IP}/nagios"
+echo "Username: nagiosadmin"
+echo "Password: nagiosadmin"
+echo "IMPORTANT: Please change the default password immediately!"
+echo "Note: If SELinux was previously enabled, a reboot is recommended."
